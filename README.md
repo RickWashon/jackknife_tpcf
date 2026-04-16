@@ -1,6 +1,6 @@
-# corrfunc_subbox_jackknife
+# corrfunc_jackknife
 
-`corrfunc_subbox_jackknife.py` computes the 2-point correlation function (TPCF) and jackknife uncertainties in a periodic simulation box using Corrfunc pair counts.
+`corrfunc_jackknife.py` computes the 2-point correlation function (TPCF) and jackknife uncertainties in a periodic simulation box using Corrfunc pair counts.
 
 The implementation partitions the box into an `ndiv × ndiv × ndiv` regular grid of subboxes, precomputes subbox-level pair counts once, and then builds leave-one-out (LOO) jackknife samples by subtraction.
 
@@ -29,7 +29,7 @@ pip install numpy Corrfunc
 ## Main API
 
 ```python
-from corrfunc_subbox_jackknife import corrfunc_subbox_jackknife
+from corrfunc_jackknife import corrfunc_subbox_jackknife
 ```
 
 ```python
@@ -82,7 +82,7 @@ result = corrfunc_subbox_jackknife(
 Running the module directly executes a random-point benchmark:
 
 ```bash
-python corrfunc_subbox_jackknife.py
+python corrfunc_jackknife.py
 ```
 
 This prints runtime and example output slices (`xi_full`, `xi_jack_mean`, `xi_err`).
