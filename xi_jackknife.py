@@ -309,35 +309,51 @@ def corrfunc_xi_jackknife(
     natural_rr_mode: str = "analytic",
 ) -> Dict[str, Any]:
     """
-    High-level callable API.
+    Jackknife estimator of xi(r) for cubic periodic boxes.
 
     Parameters
     ----------
-    sample_xyz : array-like, shape (N, 3)
-        Input points.
-    rbins : array-like, shape (nbins+1,)
-        Radial bin edges.
+    sample_xyz : ndarray of shape (N, 3)
+        Data positions [x, y, z] in a periodic cubic box.
+    rbins : 1D ndarray of shape (Nr+1,)
+        Radial separation bin edges. Must be increasing.
     boxsize : float
-        Periodic box size.
-    ndiv : int
-        Number of subboxes per dimension.
-    nthreads : int
-        Corrfunc thread count.
-    random_xyz : array-like, shape (Nr, 3), optional
-        Random points; required for `estimator='landy-szalay'`.
-    estimator : {'natural', 'landy-szalay'}
-        Correlation-function estimator for full xi and each LOO xi.
-    natural_rr_mode : {'analytic', 'random'}
-        Only used when estimator='natural'.
-        'analytic': fast RR approximation for each LOO.
-        'random': use LOO random catalogs for RR (geometry-matched, slower, more accurate at large scales).
+        Side length of the periodic box. Units must match `sample_xyz` and `rbins`.
+    ndiv : int, default=4
+        Number of jackknife splits per axis. Total subboxes = ndiv^3.
+    nthreads : int, default=8
+        Number of OpenMP threads passed to Corrfunc.
+    random_xyz : ndarray of shape (Nrand, 3), optional
+        Random catalog in the same periodic box.
+        Required for:
+        - `estimator='landy-szalay'`
+        - `estimator='natural'` with `natural_rr_mode='random'`
+    estimator : {'natural', 'landy-szalay'}, default='natural'
+        Correlation estimator:
+        - 'natural'      : xi = DD/RR - 1
+        - 'landy-szalay' : xi = (DD - 2DR + RR)/RR
+    natural_rr_mode : {'analytic', 'random'}, default='analytic'
+        Only used when `estimator='natural'`:
+        - 'analytic' : fast analytic RR approximation (can bias large-scale amplitude)
+        - 'random'   : RR from random-catalog LOO counts (slower, geometry-matched)
 
     Returns
     -------
-    dict
-        `xi_mean` is set to full-sample xi (recommended central value).
-        `xi_jack_mean` is the mean across leave-one-out xi (diagnostic only).
-        JK is used to estimate covariance/error.
+    result : dict
+        Main keys:
+        - xi_full / xi_mean : ndarray, shape (Nr,)
+        - xi_jack : ndarray, shape (n_subboxes, Nr)
+        - xi_jack_mean : ndarray, shape (Nr,) (diagnostic)
+        - xi_err : ndarray, shape (Nr,)
+        - cov : ndarray, shape (Nr, Nr)
+        - dd_total, rr_full, dr_full
+        - r_bin_edges, r_bin_centers
+        - timing: pair_precompute_s, jackknife_s, total_s
+
+    Notes
+    -----
+    - `xi_mean` is set equal to full-sample xi (`xi_full`) as the recommended central value.
+    - `xi_jack_mean` is the mean over LOO realizations and is provided for diagnostics.
     """
     rbins = np.asarray(rbins, dtype=np.float64)
     estimator = estimator.lower()

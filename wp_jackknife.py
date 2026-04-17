@@ -324,14 +324,58 @@ def corrfunc_wp_jackknife(
     natural_rr_mode: str = "analytic",
 ) -> Dict[str, Any]:
     """
-    Jackknife wp(rp) in cubic periodic box.
+    Jackknife estimator of projected correlation wp(rp) for cubic periodic boxes.
 
-    estimator:
-      - 'natural'      : DD/RR - 1
-      - 'landy-szalay' : (DD - 2DR + RR)/RR
+    Parameters
+    ----------
+    sample_xyz : ndarray of shape (N, 3)
+        Data positions [x, y, z] in a periodic cubic box.
+    rp_bins : 1D ndarray of shape (Nrp+1,)
+        Projected-separation bin edges. Must be increasing.
+    pimax : float
+        Maximum line-of-sight separation for rp-pi counting.
+        In this wrapper, Corrfunc DDrppi is used with unit pi bins, so
+        effective `pimax` must be integer-valued.
+    dpi : float
+        Pi-bin width argument. Corrfunc DDrppi fixed-bin mode requires `dpi=1`.
+    boxsize : float
+        Side length of the periodic box. Units must match coordinates and bins.
+    ndiv : int, default=4
+        Number of jackknife splits per axis. Total subboxes = ndiv^3.
+    nthreads : int, default=8
+        Number of OpenMP threads passed to Corrfunc.
+    random_xyz : ndarray of shape (Nrand, 3), optional
+        Random catalog in the same periodic box.
+        Required for:
+        - `estimator='landy-szalay'`
+        - `estimator='natural'` with `natural_rr_mode='random'`
+    estimator : {'natural', 'landy-szalay'}, default='natural'
+        Estimator in rp-pi space before projection:
+        - 'natural'      : xi = DD/RR - 1
+        - 'landy-szalay' : xi = (DD - 2DR + RR)/RR
+    natural_rr_mode : {'analytic', 'random'}, default='analytic'
+        Only used when `estimator='natural'`:
+        - 'analytic' : fast analytic RR in rp-pi (can bias amplitude)
+        - 'random'   : RR from random-catalog LOO counts
 
-    Notes on dpi:
-      Corrfunc DDrppi has fixed pi-bin width of 1. This wrapper requires dpi=1.
+    Returns
+    -------
+    result : dict
+        Main keys:
+        - wp_full / wp_mean : ndarray, shape (Nrp,)
+        - wp_jack : ndarray, shape (n_subboxes, Nrp)
+        - wp_jack_mean : ndarray, shape (Nrp,) (diagnostic)
+        - wp_err : ndarray, shape (Nrp,)
+        - cov_wp : ndarray, shape (Nrp, Nrp)
+        - xi_full_rppi, xi_jack_rppi, cov_xi_rppi (flattened rp-pi space)
+        - dd_total, rr_full, dr_full
+        - rp_bin_edges, rp_bin_centers, pi_edges
+        - timing: pair_precompute_s, jackknife_s, total_s
+
+    Notes
+    -----
+    - `dpi` is validated and forced to Corrfunc-compatible usage (`dpi=1`).
+    - `wp_mean` is set equal to `wp_full` as the recommended central value.
     """
     rp_bins = np.asarray(rp_bins, dtype=np.float64)
     estimator = estimator.lower()

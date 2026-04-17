@@ -2,8 +2,10 @@ import time
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
 from typing import Dict, List, Tuple, Any
+from numbers import Integral
 
 import numpy as np
+from Corrfunc.mocks.DDrppi_mocks import DDrppi_mocks
 from Corrfunc.theory.DDrppi import DDrppi
 
 
@@ -34,18 +36,168 @@ class ObserveRpPiCrossPairCounts:
     n_points_2_subbox: np.ndarray
 
 
-def _split_xyz(sample_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert (N,3) coordinates to x,y,z arrays."""
-    sample_xyz = np.asarray(sample_xyz)
-    if sample_xyz.ndim != 2 or sample_xyz.shape[1] != 3:
-        raise ValueError("sample_xyz must have shape (N, 3)")
-    return sample_xyz[:, 0], sample_xyz[:, 1], sample_xyz[:, 2]
+def _resolve_samples(
+    coord_system: str,
+    sample_radecz: np.ndarray = None,
+    random_radecz: np.ndarray = None,
+    sample_xyz: np.ndarray = None,
+    random_xyz: np.ndarray = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    coord = coord_system.lower()
+    if coord not in ("radecz", "xyz"):
+        raise ValueError("coord_system must be 'radecz' or 'xyz'")
+
+    if coord == "radecz":
+        sample = sample_radecz if sample_radecz is not None else sample_xyz
+        randoms = random_radecz if random_radecz is not None else random_xyz
+    else:
+        sample = sample_xyz if sample_xyz is not None else sample_radecz
+        randoms = random_xyz if random_xyz is not None else random_radecz
+
+    if sample is None or randoms is None:
+        raise ValueError("Missing sample/random inputs for the selected coord_system")
+
+    sample = np.asarray(sample, dtype=np.float64)
+    randoms = np.asarray(randoms, dtype=np.float64)
+    if sample.ndim != 2 or sample.shape[1] != 3:
+        raise ValueError("sample input must have shape (N, 3)")
+    if randoms.ndim != 2 or randoms.shape[1] != 3:
+        raise ValueError("random input must have shape (N, 3)")
+    return sample, randoms
+
+
+
+
+
+
+def _coerce_h0_km_s_mpc(h0: Any) -> float:
+    h0v = float(h0)
+    if h0v <= 0:
+        raise ValueError("H0 must be > 0")
+    if h0v < 2.0:
+        raise ValueError(
+            "H0 looks like little-h (e.g. 0.677). "
+            "Please pass H0 in km/s/Mpc (e.g. 67.7)."
+        )
+    return h0v
+
+
+def _coerce_astropy_cosmology_obj(cosmo_like: Any) -> Any:
+    """Build/validate an astropy cosmology object with .comoving_distance."""
+    if cosmo_like is None:
+        raise ValueError("astropy cosmology input is None")
+
+    if hasattr(cosmo_like, "comoving_distance"):
+        return cosmo_like
+
+    if isinstance(cosmo_like, str):
+        import astropy.cosmology as acosmo
+
+        if not hasattr(acosmo, cosmo_like):
+            raise ValueError(f"Unknown astropy cosmology preset: {cosmo_like}")
+        obj = getattr(acosmo, cosmo_like)
+        if not hasattr(obj, "comoving_distance"):
+            raise ValueError(f"astropy preset {cosmo_like} is not a cosmology instance")
+        return obj
+
+    if isinstance(cosmo_like, dict):
+        from astropy.cosmology import FlatLambdaCDM, LambdaCDM
+
+        d = dict(cosmo_like)
+        if "H0" not in d:
+            if "h" in d:
+                d["H0"] = 100.0 * float(d.pop("h"))
+            else:
+                raise ValueError("cosmology dict must contain H0 (or h) and Om0")
+
+        if "Om0" not in d:
+            raise ValueError("cosmology dict must contain Om0")
+
+        H0 = _coerce_h0_km_s_mpc(d["H0"])
+        Om0 = float(d["Om0"])
+
+        if "Ode0" in d:
+            return LambdaCDM(H0=H0, Om0=Om0, Ode0=float(d["Ode0"]))
+        return FlatLambdaCDM(H0=H0, Om0=Om0)
+
+    raise TypeError(
+        "astropy cosmology input must be an astropy cosmology object, "
+        "a preset string (e.g. 'Planck18'), or a dict {'H0':67.7, 'Om0':0.31}."
+    )
+
+
+def _resolve_radecz_cosmology_config(
+    cosmology: Any,
+    use_astropy_comoving: bool,
+    astropy_cosmology: Any,
+) -> Tuple[int, Any]:
+    """
+    Returns:
+      corrfunc_cosmology_index: int in {1,2}
+      astropy_cosmology_obj: cosmology object or None
+    """
+    if use_astropy_comoving:
+        source = astropy_cosmology if astropy_cosmology is not None else cosmology
+        return 1, _coerce_astropy_cosmology_obj(source)
+
+    if isinstance(cosmology, Integral):
+        cidx = int(cosmology)
+        if cidx not in (1, 2):
+            raise ValueError("For Corrfunc mocks, cosmology must be 1 or 2")
+        return cidx, None
+
+    raise ValueError(
+        "When use_astropy_comoving=False in radecz mode, cosmology must be Corrfunc index 1 or 2. "
+        "To use arbitrary cosmology dict/object, set use_astropy_comoving=True."
+    )
+
+
+def _maybe_convert_radecz_to_comoving(
+    sample_pos: np.ndarray,
+    random_pos: np.ndarray,
+    coord_system: str,
+    is_comoving_dist: bool,
+    use_astropy_comoving: bool,
+    astropy_cosmology: Any,
+    input_is_cz: bool,
+    speed_of_light_kms: float = 299792.458,
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """
+    Optionally convert input [RA, DEC, z/cz] to [RA, DEC, comoving_distance(Mpc)]
+    with astropy cosmology, then force is_comoving_dist=True for Corrfunc.mocks.
+    """
+    if coord_system.lower() != "radecz":
+        return sample_pos, random_pos, bool(is_comoving_dist)
+
+    if not use_astropy_comoving:
+        return sample_pos, random_pos, bool(is_comoving_dist)
+
+    if astropy_cosmology is None:
+        raise ValueError("astropy_cosmology is required when use_astropy_comoving=True")
+
+    c_kms = float(speed_of_light_kms)
+
+    def _to_comoving_mpc(col3: np.ndarray) -> np.ndarray:
+        z = col3 / c_kms if input_is_cz else col3
+        dist = astropy_cosmology.comoving_distance(z)
+        if hasattr(dist, "to_value"):
+            try:
+                return np.asarray(dist.to_value("Mpc"), dtype=np.float64)
+            except Exception:
+                return np.asarray(dist.to_value(), dtype=np.float64)
+        return np.asarray(dist, dtype=np.float64)
+
+    s = np.asarray(sample_pos, dtype=np.float64).copy()
+    r = np.asarray(random_pos, dtype=np.float64).copy()
+    s[:, 2] = _to_comoving_mpc(s[:, 2])
+    r[:, 2] = _to_comoving_mpc(r[:, 2])
+    return s, r, True
 
 
 def _validate_dpi_and_pimax(dpi: float, pimax: float) -> Tuple[float, int]:
     """Validate Corrfunc DDrppi pi-binning: fixed unit bins with integer pimax."""
     if not np.isclose(float(dpi), 1.0):
-        raise ValueError("Corrfunc.theory.DDrppi does not take `dpi`; internal pi-bin width is fixed to 1. Use dpi=1.")
+        raise ValueError("Corrfunc DDrppi uses fixed pi-bin width 1. Use dpi=1.")
     if float(pimax) <= 0:
         raise ValueError("pimax must be > 0")
 
@@ -57,20 +209,19 @@ def _validate_dpi_and_pimax(dpi: float, pimax: float) -> Tuple[float, int]:
 
 
 def _parse_bounds(
-    sample_xyz: np.ndarray,
-    random_xyz: np.ndarray,
+    sample_pos: np.ndarray,
+    random_pos: np.ndarray,
     bounds: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = None,
 ) -> np.ndarray:
-    """Build bounds for subbox partition; default uses data+random min/max."""
     if bounds is not None:
         b = np.asarray(bounds, dtype=np.float64)
         if b.shape != (3, 2):
-            raise ValueError("bounds must have shape ((xmin,xmax),(ymin,ymax),(zmin,zmax))")
+            raise ValueError("bounds must have shape ((x0,x1),(y0,y1),(z0,z1))")
         return b
 
-    all_xyz = np.vstack((np.asarray(sample_xyz), np.asarray(random_xyz)))
-    mins = np.min(all_xyz, axis=0)
-    maxs = np.max(all_xyz, axis=0)
+    all_pos = np.vstack((sample_pos, random_pos))
+    mins = np.min(all_pos, axis=0)
+    maxs = np.max(all_pos, axis=0)
     b = np.column_stack((mins, maxs))
 
     eps = 1.0e-12
@@ -80,27 +231,14 @@ def _parse_bounds(
     return b
 
 
-def _assign_subbox_ids_observe(
-    x: np.ndarray,
-    y: np.ndarray,
-    z: np.ndarray,
-    bounds_xyz: np.ndarray,
-    ndiv: int,
-) -> np.ndarray:
-    """Assign points to ndiv^3 subboxes using explicit bounds."""
+def _assign_subbox_ids(pos: np.ndarray, bounds_xyz: np.ndarray, ndiv: int) -> np.ndarray:
     mins = bounds_xyz[:, 0]
     maxs = bounds_xyz[:, 1]
     size = np.maximum(maxs - mins, 1.0e-12)
 
-    fx = (x - mins[0]) / size[0]
-    fy = (y - mins[1]) / size[1]
-    fz = (z - mins[2]) / size[2]
-
-    ix = np.minimum(np.maximum((fx * ndiv).astype(np.int32), 0), ndiv - 1)
-    iy = np.minimum(np.maximum((fy * ndiv).astype(np.int32), 0), ndiv - 1)
-    iz = np.minimum(np.maximum((fz * ndiv).astype(np.int32), 0), ndiv - 1)
-
-    return ix + ndiv * (iy + ndiv * iz)
+    frac = (pos - mins[None, :]) / size[None, :]
+    idx = np.minimum(np.maximum((frac * ndiv).astype(np.int32), 0), ndiv - 1)
+    return idx[:, 0] + ndiv * (idx[:, 1] + ndiv * idx[:, 2])
 
 
 def _xi_landy_szalay_from_counts(
@@ -110,7 +248,6 @@ def _xi_landy_szalay_from_counts(
     n_data: int,
     n_rand: int,
 ) -> np.ndarray:
-    """Landy-Szalay xi = (DD - 2DR + RR)/RR with pair-count normalization."""
     if n_data < 2 or n_rand < 2:
         return np.zeros_like(dd_counts, dtype=np.float64)
 
@@ -129,23 +266,104 @@ def _wp_from_xi_rppi_flat(xi_flat: np.ndarray, n_rp_bins: int, n_pi_bins: int, d
     return 2.0 * np.sum(xi2d * dpi, axis=1)
 
 
-def precompute_observe_rppi_pair_counts(
-    sample_xyz: np.ndarray,
+def _pair_counts_rppi(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    rp_bins: np.ndarray,
+    pimax: float,
+    nthreads: int,
+    coord_system: str,
+    cosmology: int,
+    is_comoving_dist: bool,
+    autocorr: bool,
+) -> np.ndarray:
+    coord = coord_system.lower()
+    if coord == "radecz":
+        if autocorr:
+            res = DDrppi_mocks(
+                autocorr=1,
+                cosmology=cosmology,
+                nthreads=nthreads,
+                pimax=pimax,
+                binfile=rp_bins,
+                RA1=p1[:, 0],
+                DEC1=p1[:, 1],
+                CZ1=p1[:, 2],
+                is_comoving_dist=is_comoving_dist,
+                output_rpavg=False,
+                verbose=False,
+            )
+            return res["npairs"].astype(np.float64)
+
+        res = DDrppi_mocks(
+            autocorr=0,
+            cosmology=cosmology,
+            nthreads=nthreads,
+            pimax=pimax,
+            binfile=rp_bins,
+            RA1=p1[:, 0],
+            DEC1=p1[:, 1],
+            CZ1=p1[:, 2],
+            RA2=p2[:, 0],
+            DEC2=p2[:, 1],
+            CZ2=p2[:, 2],
+            is_comoving_dist=is_comoving_dist,
+            output_rpavg=False,
+            verbose=False,
+        )
+        return res["npairs"].astype(np.float64)
+
+    if autocorr:
+        res = DDrppi(
+            autocorr=1,
+            nthreads=nthreads,
+            pimax=pimax,
+            binfile=rp_bins,
+            X1=p1[:, 0],
+            Y1=p1[:, 1],
+            Z1=p1[:, 2],
+            periodic=False,
+            output_rpavg=False,
+            verbose=False,
+        )
+        return res["npairs"].astype(np.float64)
+
+    res = DDrppi(
+        autocorr=0,
+        nthreads=nthreads,
+        pimax=pimax,
+        binfile=rp_bins,
+        X1=p1[:, 0],
+        Y1=p1[:, 1],
+        Z1=p1[:, 2],
+        X2=p2[:, 0],
+        Y2=p2[:, 1],
+        Z2=p2[:, 2],
+        periodic=False,
+        output_rpavg=False,
+        verbose=False,
+    )
+    return res["npairs"].astype(np.float64)
+
+
+def _precompute_pair(
+    sample_pos: np.ndarray,
     rp_bins: np.ndarray,
     pimax: float,
     dpi: float,
     ndiv: int,
     nthreads: int,
     bounds_xyz: np.ndarray,
+    coord_system: str,
+    cosmology: int,
+    is_comoving_dist: bool,
 ) -> ObserveRpPiPairCounts:
-    """Precompute DD(i,i), DD(i,j) for non-periodic (rp,pi) counting."""
-    x, y, z = _split_xyz(sample_xyz)
     dpi, n_pi = _validate_dpi_and_pimax(dpi=dpi, pimax=pimax)
 
-    sub_ids = _assign_subbox_ids_observe(x, y, z, bounds_xyz=bounds_xyz, ndiv=ndiv)
+    sub_ids = _assign_subbox_ids(sample_pos, bounds_xyz=bounds_xyz, ndiv=ndiv)
     n_sub = ndiv ** 3
-    indices: List[np.ndarray] = [np.where(sub_ids == i)[0] for i in range(n_sub)]
-    n_points_subbox = np.array([idx.size for idx in indices], dtype=np.int64)
+    idxs: List[np.ndarray] = [np.where(sub_ids == i)[0] for i in range(n_sub)]
+    n_points_subbox = np.array([idx.size for idx in idxs], dtype=np.int64)
 
     n_rp = len(rp_bins) - 1
     n_flat = n_rp * n_pi
@@ -155,42 +373,21 @@ def precompute_observe_rppi_pair_counts(
     involved_counts = np.zeros((n_sub, n_flat), dtype=np.float64)
 
     for i, j in combinations_with_replacement(range(n_sub), 2):
-        idx_i = indices[i]
-        idx_j = indices[j]
-        if idx_i.size == 0 or idx_j.size == 0:
+        iidx = idxs[i]
+        jidx = idxs[j]
+        if iidx.size == 0 or jidx.size == 0:
             counts = np.zeros(n_flat, dtype=np.float64)
         elif i == j:
-            result = DDrppi(
-                autocorr=1,
-                nthreads=nthreads,
-                pimax=pimax,
-                binfile=rp_bins,
-                X1=x[idx_i],
-                Y1=y[idx_i],
-                Z1=z[idx_i],
-                periodic=False,
-                output_rpavg=False,
-                verbose=False,
+            counts = _pair_counts_rppi(
+                sample_pos[iidx], sample_pos[iidx], rp_bins, pimax, nthreads,
+                coord_system, cosmology, is_comoving_dist, autocorr=True
             )
-            counts = result["npairs"].astype(np.float64)
         else:
-            result = DDrppi(
-                autocorr=0,
-                nthreads=nthreads,
-                pimax=pimax,
-                binfile=rp_bins,
-                X1=x[idx_i],
-                Y1=y[idx_i],
-                Z1=z[idx_i],
-                X2=x[idx_j],
-                Y2=y[idx_j],
-                Z2=z[idx_j],
-                periodic=False,
-                output_rpavg=False,
-                verbose=False,
+            counts = _pair_counts_rppi(
+                sample_pos[iidx], sample_pos[jidx], rp_bins, pimax, nthreads,
+                coord_system, cosmology, is_comoving_dist, autocorr=False
             )
-            # autocorr=1 is ordered-pair convention, so cross terms need x2
-            counts = 2.0 * result["npairs"].astype(np.float64)
+            counts = 2.0 * counts
 
         pair_counts[(i, j)] = counts
         total_counts += counts
@@ -207,67 +404,54 @@ def precompute_observe_rppi_pair_counts(
         rp_bin_edges=np.asarray(rp_bins, dtype=np.float64),
         pi_edges=pi_edges,
         n_subboxes=n_sub,
-        n_points_total=x.size,
+        n_points_total=sample_pos.shape[0],
         n_points_subbox=n_points_subbox,
         n_rp_bins=n_rp,
         n_pi_bins=n_pi,
     )
 
 
-def precompute_observe_rppi_cross_pair_counts(
-    sample_xyz_1: np.ndarray,
-    sample_xyz_2: np.ndarray,
+def _precompute_cross(
+    sample_pos_1: np.ndarray,
+    sample_pos_2: np.ndarray,
     rp_bins: np.ndarray,
     pimax: float,
     dpi: float,
     ndiv: int,
     nthreads: int,
     bounds_xyz: np.ndarray,
+    coord_system: str,
+    cosmology: int,
+    is_comoving_dist: bool,
 ) -> ObserveRpPiCrossPairCounts:
-    """Precompute DR(i,j) for non-periodic (rp,pi) counting."""
-    x1, y1, z1 = _split_xyz(sample_xyz_1)
-    x2, y2, z2 = _split_xyz(sample_xyz_2)
     dpi, n_pi = _validate_dpi_and_pimax(dpi=dpi, pimax=pimax)
 
-    sub_ids_1 = _assign_subbox_ids_observe(x1, y1, z1, bounds_xyz=bounds_xyz, ndiv=ndiv)
-    sub_ids_2 = _assign_subbox_ids_observe(x2, y2, z2, bounds_xyz=bounds_xyz, ndiv=ndiv)
+    sub1 = _assign_subbox_ids(sample_pos_1, bounds_xyz=bounds_xyz, ndiv=ndiv)
+    sub2 = _assign_subbox_ids(sample_pos_2, bounds_xyz=bounds_xyz, ndiv=ndiv)
 
     n_sub = ndiv ** 3
-    idxs_1: List[np.ndarray] = [np.where(sub_ids_1 == i)[0] for i in range(n_sub)]
-    idxs_2: List[np.ndarray] = [np.where(sub_ids_2 == i)[0] for i in range(n_sub)]
+    idx1: List[np.ndarray] = [np.where(sub1 == i)[0] for i in range(n_sub)]
+    idx2: List[np.ndarray] = [np.where(sub2 == i)[0] for i in range(n_sub)]
 
-    n_points_1_sub = np.array([idx.size for idx in idxs_1], dtype=np.int64)
-    n_points_2_sub = np.array([idx.size for idx in idxs_2], dtype=np.int64)
+    n_points_1_sub = np.array([x.size for x in idx1], dtype=np.int64)
+    n_points_2_sub = np.array([x.size for x in idx2], dtype=np.int64)
 
     n_rp = len(rp_bins) - 1
     n_flat = n_rp * n_pi
-
     pair_counts = np.zeros((n_sub, n_sub, n_flat), dtype=np.float64)
 
     for i in range(n_sub):
-        idx_i = idxs_1[i]
-        if idx_i.size == 0:
+        iidx = idx1[i]
+        if iidx.size == 0:
             continue
         for j in range(n_sub):
-            idx_j = idxs_2[j]
-            if idx_j.size == 0:
+            jidx = idx2[j]
+            if jidx.size == 0:
                 continue
-            result = DDrppi(
-                autocorr=0,
-                nthreads=nthreads,
-                pimax=pimax,
-                binfile=rp_bins,
-                X1=x1[idx_i],
-                Y1=y1[idx_i],
-                Z1=z1[idx_i],
-                X2=x2[idx_j],
-                Y2=y2[idx_j],
-                Z2=z2[idx_j],
-                periodic=False,
-                output_rpavg=False,
-                verbose=False,
+            pair_counts[i, j] = _pair_counts_rppi(
+                sample_pos_1[iidx], sample_pos_2[jidx], rp_bins, pimax, nthreads,
+                coord_system, cosmology, is_comoving_dist, autocorr=False
             )
-            pair_counts[i, j] = result["npairs"].astype(np.float64)
 
     row_sums = pair_counts.sum(axis=1)
     col_sums = pair_counts.sum(axis=0)
@@ -279,68 +463,187 @@ def precompute_observe_rppi_cross_pair_counts(
         row_sums=row_sums,
         col_sums=col_sums,
         n_subboxes=n_sub,
-        n_points_1_total=x1.size,
-        n_points_2_total=x2.size,
+        n_points_1_total=sample_pos_1.shape[0],
+        n_points_2_total=sample_pos_2.shape[0],
         n_points_1_subbox=n_points_1_sub,
         n_points_2_subbox=n_points_2_sub,
     )
 
 
 def corrfunc_wp_observe_jackknife(
-    sample_xyz: np.ndarray,
-    random_xyz: np.ndarray,
-    rp_bins: np.ndarray,
-    pimax: float,
-    dpi: float,
+    sample_radecz: np.ndarray = None,
+    random_radecz: np.ndarray = None,
+    rp_bins: np.ndarray = None,
+    pimax: float = 40,
+    dpi: float = 1,
     ndiv: int = 4,
     nthreads: int = 8,
     bounds: Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]] = None,
     estimator: str = "landy-szalay",
+    coord_system: str = "radecz",
+    sample_xyz: np.ndarray = None,
+    random_xyz: np.ndarray = None,
+    cosmology: Any = 1,
+    is_comoving_dist: bool = False,
+    use_astropy_comoving: bool = False,
+    astropy_cosmology: Any = None,
+    input_is_cz: bool = True,
+    speed_of_light_kms: float = 299792.458,
 ) -> Dict[str, Any]:
     """
-    Jackknife wp(rp) for observed (non-periodic) samples.
+    Jackknife estimator of projected correlation wp(rp) for observed/non-periodic catalogs.
 
-    Note:
-      - Only Landy-Szalay estimator is supported for observed-data mode.
-      - Natural mode is intentionally not supported.
-      - Corrfunc DDrppi has fixed pi-bin width of 1, so this wrapper requires dpi=1.
+    Parameters
+    ----------
+    sample_radecz : ndarray of shape (N, 3), optional
+        Data catalog in observed coordinates [RA(deg), DEC(deg), col3].
+        col3 can be z, cz(km/s), or comoving distance according to options.
+        Used when `coord_system='radecz'`.
+    random_radecz : ndarray of shape (Nr, 3), optional
+        Random catalog in the same convention as `sample_radecz`.
+    rp_bins : 1D ndarray of shape (Nrp+1,)
+        Projected separation bin edges. Must be increasing.
+    pimax : float, default=40
+        Maximum line-of-sight separation for rp-pi counting.
+        In Corrfunc DDrppi interface used here, effective pi bins are unit-width,
+        so pimax must be integer-valued.
+    dpi : float, default=1
+        Pi-bin width control. Corrfunc DDrppi fixed-width mode requires dpi=1.
+    ndiv : int, default=4
+        Number of jackknife splits per axis. Total subboxes = ndiv^3.
+    nthreads : int, default=8
+        Number of OpenMP threads passed to Corrfunc.
+    bounds : tuple of 3 tuples, optional
+        Manual bounding box for subbox assignment.
+    estimator : {'landy-szalay'}, default='landy-szalay'
+        Observe mode only supports Landy-Szalay.
+    coord_system : {'radecz', 'xyz'}, default='radecz'
+        'radecz' uses Corrfunc.mocks.DDrppi_mocks.
+        'xyz' uses Corrfunc.theory.DDrppi(periodic=False).
+    sample_xyz : ndarray of shape (N, 3), optional
+        Data catalog in Cartesian coordinates [x, y, z] for `coord_system='xyz'`.
+    random_xyz : ndarray of shape (Nr, 3), optional
+        Random catalog in Cartesian coordinates [x, y, z].
+    cosmology : int or str or dict or astropy cosmology object, default=1
+        Cosmology control in `coord_system='radecz'`:
+        - `use_astropy_comoving=False`: must be Corrfunc index {1,2}
+        - `use_astropy_comoving=True`: can be astropy object/string/dict;
+          fallback source when `astropy_cosmology` is None.
+    is_comoving_dist : bool, default=False
+        Passed to Corrfunc only in `radecz` mode when
+        `use_astropy_comoving=False`.
+    use_astropy_comoving : bool, default=False
+        If True in `radecz` mode, convert col3 to comoving distance via astropy
+        and force Corrfunc to treat input as comoving distance.
+    astropy_cosmology : str or dict or astropy cosmology object, optional
+        Explicit cosmology source for astropy conversion.
+    input_is_cz : bool, default=True
+        Only used when `use_astropy_comoving=True` and `coord_system='radecz'`.
+        True means col3 is cz(km/s); False means col3 is redshift z.
+    speed_of_light_kms : float, default=299792.458
+        Speed of light used for cz->z conversion.
+
+    Returns
+    -------
+    result : dict
+        Main keys:
+        - wp_full / wp_mean : ndarray, shape (Nrp,)
+        - wp_jack : ndarray, shape (n_subboxes, Nrp)
+        - wp_err : ndarray, shape (Nrp,)
+        - cov_wp : ndarray, shape (Nrp, Nrp)
+        - xi_full_rppi, xi_jack_rppi (flattened rp-pi xi)
+        - rp_bin_edges, rp_bin_centers, pi_edges
+        - timing: pair_precompute_s, jackknife_s, total_s
+        - cosmology diagnostics: cosmology, corrfunc_cosmology,
+          is_comoving_dist, use_astropy_comoving, astropy_cosmology_name
+
+    Notes
+    -----
+    - This function is for non-periodic/observed catalogs.
+    - LS estimator only; natural estimator is intentionally disabled.
     """
     if estimator.lower() != "landy-szalay":
         raise ValueError("For observed data, only estimator='landy-szalay' is supported.")
+    if rp_bins is None:
+        raise ValueError("rp_bins is required")
+
+    coord_system = coord_system.lower()
+    if coord_system not in ("radecz", "xyz"):
+        raise ValueError("coord_system must be 'radecz' or 'xyz'")
+
+    corrfunc_cosmology = 1
+    astropy_cosmology_obj = None
+    if coord_system == "radecz":
+        corrfunc_cosmology, astropy_cosmology_obj = _resolve_radecz_cosmology_config(
+            cosmology=cosmology,
+            use_astropy_comoving=use_astropy_comoving,
+            astropy_cosmology=astropy_cosmology,
+        )
 
     rp_bins = np.asarray(rp_bins, dtype=np.float64)
     dpi, n_pi_fixed = _validate_dpi_and_pimax(dpi=dpi, pimax=pimax)
     pimax = float(n_pi_fixed)
-    bounds_xyz = _parse_bounds(sample_xyz=sample_xyz, random_xyz=random_xyz, bounds=bounds)
+
+    sample_pos, random_pos = _resolve_samples(
+        coord_system=coord_system,
+        sample_radecz=sample_radecz,
+        random_radecz=random_radecz,
+        sample_xyz=sample_xyz,
+        random_xyz=random_xyz,
+    )
+
+    sample_pos, random_pos, is_comoving_dist_eff = _maybe_convert_radecz_to_comoving(
+        sample_pos=sample_pos,
+        random_pos=random_pos,
+        coord_system=coord_system,
+        is_comoving_dist=is_comoving_dist,
+        use_astropy_comoving=use_astropy_comoving,
+        astropy_cosmology=astropy_cosmology,
+        input_is_cz=input_is_cz,
+        speed_of_light_kms=speed_of_light_kms,
+    )
+
+    is_comoving_dist = is_comoving_dist_eff
+
+    bounds_xyz = _parse_bounds(sample_pos=sample_pos, random_pos=random_pos, bounds=bounds)
 
     t0 = time.perf_counter()
-    dd_precomp = precompute_observe_rppi_pair_counts(
-        sample_xyz=sample_xyz,
+    dd_precomp = _precompute_pair(
+        sample_pos=sample_pos,
         rp_bins=rp_bins,
         pimax=pimax,
         dpi=dpi,
         ndiv=ndiv,
         nthreads=nthreads,
         bounds_xyz=bounds_xyz,
+        coord_system=coord_system,
+        cosmology=corrfunc_cosmology,
+        is_comoving_dist=is_comoving_dist,
     )
-    rr_precomp = precompute_observe_rppi_pair_counts(
-        sample_xyz=random_xyz,
+    rr_precomp = _precompute_pair(
+        sample_pos=random_pos,
         rp_bins=rp_bins,
         pimax=pimax,
         dpi=dpi,
         ndiv=ndiv,
         nthreads=nthreads,
         bounds_xyz=bounds_xyz,
+        coord_system=coord_system,
+        cosmology=corrfunc_cosmology,
+        is_comoving_dist=is_comoving_dist,
     )
-    dr_precomp = precompute_observe_rppi_cross_pair_counts(
-        sample_xyz_1=sample_xyz,
-        sample_xyz_2=random_xyz,
+    dr_precomp = _precompute_cross(
+        sample_pos_1=sample_pos,
+        sample_pos_2=random_pos,
         rp_bins=rp_bins,
         pimax=pimax,
         dpi=dpi,
         ndiv=ndiv,
         nthreads=nthreads,
         bounds_xyz=bounds_xyz,
+        coord_system=coord_system,
+        cosmology=corrfunc_cosmology,
+        is_comoving_dist=is_comoving_dist,
     )
     t1 = time.perf_counter()
 
@@ -367,13 +670,7 @@ def corrfunc_wp_observe_jackknife(
 
         n_d_loo = dd_precomp.n_points_total - dd_precomp.n_points_subbox[k]
         n_r_loo = rr_precomp.n_points_total - rr_precomp.n_points_subbox[k]
-        xi_jack[k] = _xi_landy_szalay_from_counts(
-            dd_counts=dd_loo,
-            dr_counts=dr_loo,
-            rr_counts=rr_loo,
-            n_data=n_d_loo,
-            n_rand=n_r_loo,
-        )
+        xi_jack[k] = _xi_landy_szalay_from_counts(dd_loo, dr_loo, rr_loo, n_d_loo, n_r_loo)
 
     xi_jack_mean = xi_jack.mean(axis=0)
     diff_xi = xi_jack - xi_jack_mean
@@ -381,8 +678,7 @@ def corrfunc_wp_observe_jackknife(
 
     wp_full = _wp_from_xi_rppi_flat(xi_full, dd_precomp.n_rp_bins, dd_precomp.n_pi_bins, dpi)
     wp_jack = np.array([
-        _wp_from_xi_rppi_flat(xi_i, dd_precomp.n_rp_bins, dd_precomp.n_pi_bins, dpi)
-        for xi_i in xi_jack
+        _wp_from_xi_rppi_flat(x, dd_precomp.n_rp_bins, dd_precomp.n_pi_bins, dpi) for x in xi_jack
     ])
     wp_jack_mean = wp_jack.mean(axis=0)
     diff_wp = wp_jack - wp_jack_mean
@@ -390,12 +686,6 @@ def corrfunc_wp_observe_jackknife(
     wp_err = np.sqrt(np.diag(cov_wp))
 
     t2 = time.perf_counter()
-
-    timing = {
-        "pair_precompute_s": t1 - t0,
-        "jackknife_s": t2 - t1,
-        "total_s": t2 - t0,
-    }
 
     return {
         "wp_mean": wp_full,
@@ -408,6 +698,7 @@ def corrfunc_wp_observe_jackknife(
         "xi_jack_mean_rppi": xi_jack_mean,
         "cov_xi_rppi": cov_xi,
         "xi_jack_rppi": xi_jack,
+        "coord_system": coord_system,
         "estimator": "landy-szalay",
         "rr_mode": "loo_randoms",
         "dd_total": dd_precomp.total_counts.copy(),
@@ -421,6 +712,16 @@ def corrfunc_wp_observe_jackknife(
         "pimax": float(pimax),
         "dpi": float(dpi),
         "n_subboxes": n_sub,
-        "bounds_xyz": bounds_xyz.copy(),
-        "timing": timing,
+        "bounds_coords": bounds_xyz.copy(),
+        "cosmology": cosmology,
+        "corrfunc_cosmology": int(corrfunc_cosmology),
+        "is_comoving_dist": bool(is_comoving_dist_eff),
+        "use_astropy_comoving": bool(use_astropy_comoving),
+        "input_is_cz": bool(input_is_cz),
+        "astropy_cosmology_name": None if astropy_cosmology_obj is None else getattr(astropy_cosmology_obj, "name", astropy_cosmology_obj.__class__.__name__),
+        "timing": {
+            "pair_precompute_s": t1 - t0,
+            "jackknife_s": t2 - t1,
+            "total_s": t2 - t0,
+        },
     }
