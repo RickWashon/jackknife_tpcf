@@ -298,7 +298,7 @@ def jackknife_xi_and_error(
     return xi_mean, err, xis, cov
 
 
-def corrfunc_subbox_jackknife(
+def corrfunc_xi_jackknife(
     sample_xyz: np.ndarray,
     rbins: np.ndarray,
     boxsize: float,
@@ -522,7 +522,7 @@ def benchmark_random_points(
     bin_edges = np.logspace(np.log10(rmin), np.log10(rmax), nbins + 1)
 
     sample_xyz = np.column_stack((x, y, z))
-    result = corrfunc_subbox_jackknife(
+    result = corrfunc_xi_jackknife(
         sample_xyz=sample_xyz,
         rbins=bin_edges,
         boxsize=boxsize,
