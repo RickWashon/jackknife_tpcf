@@ -3,6 +3,8 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 from Corrfunc.theory.DD import DD
 from Corrfunc.theory.xi import xi as corrfunc_xi_theory
+from utils.weighted_dd import weighted_dd_1h2h_auto
+from utils.dd import dd_auto
 
 
 def _split_xyz(sample_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -57,6 +59,55 @@ def _count_dd(
         output_ravg=False,
         verbose=False,
     )["npairs"].astype(np.float64)
+
+
+def _count_dd_weighted_total_auto(
+    rbins: np.ndarray,
+    nthreads: int,
+    boxsize: float,
+    sample_xyz: np.ndarray,
+    approx_cell_size: Optional[float],
+    refine_factor: int,
+    max_cells_per_dim: int,
+    use_float32: bool,
+) -> np.ndarray:
+    # dd_total is independent of host labels; unique labels make 1h path trivial.
+    n = int(sample_xyz.shape[0])
+    host = np.arange(n, dtype=np.int64)
+    res = weighted_dd_1h2h_auto(
+        sample_xyz=sample_xyz,
+        host_halo_id=host,
+        rbins=rbins,
+        boxsize=float(boxsize),
+        nthreads=int(nthreads),
+        approx_cell_size=approx_cell_size,
+        refine_factor=int(refine_factor),
+        max_cells_per_dim=int(max_cells_per_dim),
+        use_float32=bool(use_float32),
+    )
+    return np.asarray(res["dd_total"], dtype=np.float64)
+
+def _count_dd_plain_auto(
+    rbins: np.ndarray,
+    nthreads: int,
+    boxsize: float,
+    sample_xyz: np.ndarray,
+    approx_cell_size: Optional[float],
+    refine_factor: int,
+    max_cells_per_dim: int,
+    use_float32: bool,
+) -> np.ndarray:
+    res = dd_auto(
+        sample_xyz=sample_xyz,
+        rbins=rbins,
+        boxsize=float(boxsize),
+        nthreads=int(nthreads),
+        approx_cell_size=approx_cell_size,
+        refine_factor=int(refine_factor),
+        max_cells_per_dim=int(max_cells_per_dim),
+        use_float32=bool(use_float32),
+    )
+    return np.asarray(res["dd_counts"], dtype=np.float64)
 
 
 def _analytic_rr_auto(rbins: np.ndarray, n_points: int, boxsize: float) -> np.ndarray:
@@ -153,6 +204,11 @@ def corrfunc_xi(
     n_random: int = None,
     random_seed: int = 42,
     output_ravg: bool = False,
+    dd_backend: str = "corrfunc",
+    weighted_approx_cell_size: Optional[float] = None,
+    weighted_refine_factor: int = 2,
+    weighted_max_cells_per_dim: int = 100,
+    weighted_use_float32: bool = False,
 ) -> Dict[str, Any]:
     """
     Full-sample xi(r) in a periodic cubic box.
@@ -191,6 +247,18 @@ def corrfunc_xi(
         Seed for random auto-generation.
     output_ravg : bool, default=False
         Passed to Corrfunc.theory.xi in the single-sample natural fast path.
+    dd_backend : {'corrfunc', 'weighted', 'plain'}, default='corrfunc'
+        Backend for single-sample natural DD counting:
+        - 'corrfunc': use Corrfunc.theory.xi fast path
+        - 'weighted': use local weighted_dd counter for DD_total, then analytic RR
+    weighted_approx_cell_size : float, optional
+        Cell size passed to weighted DD backend when `dd_backend='weighted'`.
+    weighted_refine_factor : int, default=2
+        Grid refine factor for weighted DD backend.
+    weighted_max_cells_per_dim : int, default=100
+        Max cells per axis for weighted DD backend.
+    weighted_use_float32 : bool, default=False
+        If True, evaluate distances in mixed float32 mode in weighted DD backend.
 
     Returns
     -------
@@ -217,6 +285,9 @@ def corrfunc_xi(
     estimator = str(estimator).lower()
     if estimator not in ("natural", "landy-szalay"):
         raise ValueError("estimator must be 'natural' or 'landy-szalay'")
+    dd_backend = str(dd_backend).lower()
+    if dd_backend not in ("corrfunc", "weighted", "plain"):
+        raise ValueError("dd_backend must be 'corrfunc', 'weighted', or 'plain'")
 
     rbins = np.asarray(rbins, dtype=np.float64)
     if rbins.ndim != 1 or rbins.size < 2:
@@ -227,29 +298,70 @@ def corrfunc_xi(
 
     # single-sample fast natural path via Corrfunc.theory.xi
     if sample2_xyz is None and estimator == "natural":
-        res = corrfunc_xi_theory(
-            boxsize=float(boxsize),
-            nthreads=int(nthreads),
-            binfile=rbins,
-            X=x1,
-            Y=y1,
-            Z=z1,
-            output_ravg=bool(output_ravg),
-            verbose=False,
-        )
-        out = {
-            "xi": np.asarray(res["xi"], dtype=np.float64),
-            "r_bin_edges": rbins.copy(),
-            "r_bin_centers": rcent,
-            "mode": "single",
-            "estimator": "natural",
-            "n_points": int(arr1.shape[0]),
-        }
-        if "ravg" in res.dtype.names:
-            out["ravg"] = np.asarray(res["ravg"], dtype=np.float64)
-        if "npairs" in res.dtype.names:
-            out["dd_counts"] = np.asarray(res["npairs"], dtype=np.float64)
-        return out
+        if dd_backend == "corrfunc":
+            res = corrfunc_xi_theory(
+                boxsize=float(boxsize),
+                nthreads=int(nthreads),
+                binfile=rbins,
+                X=x1,
+                Y=y1,
+                Z=z1,
+                output_ravg=bool(output_ravg),
+                verbose=False,
+            )
+            out = {
+                "xi": np.asarray(res["xi"], dtype=np.float64),
+                "r_bin_edges": rbins.copy(),
+                "r_bin_centers": rcent,
+                "mode": "single",
+                "estimator": "natural",
+                "n_points": int(arr1.shape[0]),
+                "dd_backend": "corrfunc",
+            }
+            if "ravg" in res.dtype.names:
+                out["ravg"] = np.asarray(res["ravg"], dtype=np.float64)
+            if "npairs" in res.dtype.names:
+                out["dd_counts"] = np.asarray(res["npairs"], dtype=np.float64)
+            return out
+        else:
+            if dd_backend == "weighted":
+                dd_counts = _count_dd_weighted_total_auto(
+                    rbins=rbins,
+                    nthreads=nthreads,
+                    boxsize=boxsize,
+                    sample_xyz=arr1,
+                    approx_cell_size=weighted_approx_cell_size,
+                    refine_factor=weighted_refine_factor,
+                    max_cells_per_dim=weighted_max_cells_per_dim,
+                    use_float32=weighted_use_float32,
+                )
+            else:
+                dd_counts = _count_dd_plain_auto(
+                    rbins=rbins,
+                    nthreads=nthreads,
+                    boxsize=boxsize,
+                    sample_xyz=arr1,
+                    approx_cell_size=weighted_approx_cell_size,
+                    refine_factor=weighted_refine_factor,
+                    max_cells_per_dim=weighted_max_cells_per_dim,
+                    use_float32=weighted_use_float32,
+                )
+            rr = _analytic_rr_auto(rbins, arr1.shape[0], boxsize)
+            return {
+                "xi": _xi_natural(dd_counts, rr),
+                "dd_counts": dd_counts,
+                "rr": rr,
+                "r_bin_edges": rbins.copy(),
+                "r_bin_centers": rcent,
+                "mode": "single",
+                "estimator": "natural",
+                "n_points": int(arr1.shape[0]),
+                "dd_backend": dd_backend,
+                "weighted_use_float32": bool(weighted_use_float32),
+                "weighted_approx_cell_size": None if weighted_approx_cell_size is None else float(weighted_approx_cell_size),
+                "weighted_refine_factor": int(weighted_refine_factor),
+                "weighted_max_cells_per_dim": int(weighted_max_cells_per_dim),
+            }
 
     sample2 = None
     if sample2_xyz is not None:
